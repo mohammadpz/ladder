@@ -268,6 +268,9 @@ def setup_data(p, test_set=False):
     # Only touch test data if requested
     if test_set:
         d.test = dataset_class(("test",))
+        d.test.data_sources = (
+            (d.test.data_sources[0] / 255.).astype(numpy.float32),
+            d.test.data_sources[1])
         d.test_ind = numpy.arange(d.test.num_examples)
 
     # Setup optional whitening, only used for Cifar-10
@@ -431,6 +434,7 @@ def train(cli_params):
         "train": {
             'T_C_class': ladder.costs.class_corr,
             'T_C_de': ladder.costs.denois.values(),
+            'ERROR_RATE': ladder.error.clean,
         },
         "valid_approx": OrderedDict([
             ('V_C_class', ladder.costs.class_clean),
