@@ -1,23 +1,18 @@
 import logging
-
 import numpy as np
 from collections import OrderedDict
-
 import theano
 import theano.tensor as T
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano.tensor.nnet.conv import conv2d, ConvOp
 from theano.sandbox.cuda.blas import GpuCorrMM
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
-
 from blocks.bricks.cost import SquaredError
 from blocks.bricks.cost import CategoricalCrossEntropy, MisclassificationRate
 from blocks.graph import add_annotation, Annotation
 from blocks.roles import add_role, PARAMETER, WEIGHT, BIAS
-
 from utils import shared_param, AttributeDict
 from nn import maxpool_2d, global_meanpool_2d, BNPARAM
-
 logger = logging.getLogger('main.model')
 floatX = theano.config.floatX
 
@@ -51,8 +46,6 @@ class LadderAE():
                 x = (x,) * n_layers
             return x
 
-        p.decoder_spec = one_to_all(p.decoder_spec)
-        p.f_local_noise_std = one_to_all(p.f_local_noise_std)
         acts = one_to_all(p.get('act', 'relu'))
 
         assert n_layers == len(p.decoder_spec), "f and g need to match"
@@ -161,10 +154,10 @@ class LadderAE():
 
         input_concat = self.join(input_labeled, input_unlabeled)
 
-        def encoder(input_, path_name, input_noise_std=0, noise_std=[]):
+        def encoder(input_, path_name, noise_std=[]):
             h = input_
 
-            logger.info('  0: noise %g' % input_noise_std)
+            input_noise_std = noise_std[0] if 0 < len(noise_std) else 0.
             if input_noise_std > 0.:
                 h = h + self.noise_like(h) * input_noise_std
 
@@ -190,24 +183,20 @@ class LadderAE():
             return d
 
         # Clean, supervised
-        logger.info('Encoder: clean, labeled')
         clean = self.act.clean = encoder(input_concat, 'clean')
 
         # Corrupted, supervised
-        logger.info('Encoder: corr, labeled')
         corr = self.act.corr = encoder(input_concat, 'corr',
-                                       input_noise_std=self.p.super_noise_std,
                                        noise_std=self.p.f_local_noise_std)
         est = self.act.est = self.new_activation_dict()
 
         # Decoder path in opposite order
-        logger.info('Decoder: z_corr -> z_est')
         for i, ((_, spec), l_type, act_f) in layers[::-1]:
             z_corr = corr.unlabeled.z[i]
             z_clean = clean.unlabeled.z[i]
             z_clean_s = clean.unlabeled.s.get(i)
             z_clean_m = clean.unlabeled.m.get(i)
-            fspec = layers[i+1][1][0] if len(layers) > i+1 else (None, None)
+            fspec = layers[i + 1][1][0] if len(layers) > i + 1 else (None, None)
 
             if i == top:
                 ver = corr.unlabeled.h[i]
@@ -248,24 +237,20 @@ class LadderAE():
             est.z[i] = z_est
             est.s[i] = None
             est.m[i] = None
-            logger.info('  g%d: %10s, %s, dim %s -> %s' % (
-                i, l_type,
-                denois_print,
-                self.layer_dims.get(i+1),
-                self.layer_dims.get(i)
-                ))
 
         # Costs
         y = target_labeled.flatten()
 
-        costs.class_clean = CategoricalCrossEntropy().apply(y, clean.labeled.h[top])
-        costs.class_clean.name = 'cost_class_clean'
+        costs.CE_clean = CategoricalCrossEntropy().apply(
+            y, clean.labeled.h[top])
+        costs.CE_clean.name = 'CE_clean'
 
-        costs.class_corr = CategoricalCrossEntropy().apply(y, corr.labeled.h[top])
-        costs.class_corr.name = 'cost_class_corr'
+        costs.CE_corr = CategoricalCrossEntropy().apply(
+            y, corr.labeled.h[top])
+        costs.CE_corr.name = 'CE_corr'
 
         # This will be used for training
-        costs.total = costs.class_corr * 1.0
+        costs.total = costs.CE_corr * 1.0
         for i in range(top + 1):
             if costs.denois.get(i) and self.p.denoising_cost_x[i] > 0:
                 costs.total += costs.denois[i] * self.p.denoising_cost_x[i]
@@ -404,51 +389,7 @@ class LadderAE():
 
         h = self.apply_act(z, act_f)
 
-        logger.info('  f%d: %s, %s,%s noise %.2f, params %s, dim %s -> %s' % (
-            num, layer_type, act_f, ' BN,' if is_normalizing else '',
-            noise_std, spec[1], in_dim, output_size))
         return output_size, z_lat, m, s, h
-
-    def f_pool(self, x, spec, in_dim):
-        layer_type, dims = spec
-        num_filters = in_dim[0]
-        if "globalmeanpool" == layer_type:
-            y, output_size = global_meanpool_2d(x, num_filters)
-            # scale the variance to match normal conv layers with xavier init
-            y = y * np.float32(in_dim[-1]) * np.float32(np.sqrt(3))
-        else:
-            assert dims[0] != 1 or dims[1] != 1
-            y, output_size = maxpool_2d(x, in_dim,
-                                        poolsize=(dims[1], dims[1]),
-                                        poolstride=(dims[0], dims[0]))
-        return y, output_size
-
-    def f_conv(self, x, spec, in_dim, weight_name):
-        layer_type, dims = spec
-        num_filters = dims[0]
-        filter_size = (dims[1], dims[1])
-        stride = (dims[2], dims[2])
-
-        bm = 'full' if 'convf' in layer_type else 'valid'
-
-        num_channels = in_dim[0]
-
-        W = self.weight(self.rand_init_conv(
-            (num_filters, num_channels) + filter_size), weight_name)
-
-        if stride != (1, 1):
-            f = GpuCorrMM(subsample=stride, border_mode=bm, pad=(0, 0))
-            y = f(gpu_contiguous(x), gpu_contiguous(W))
-        else:
-            assert self.p.batch_size == self.p.valid_batch_size
-            y = conv2d(x, W, image_shape=(2*self.p.batch_size, ) + in_dim,
-                       filter_shape=((num_filters, num_channels) +
-                                     filter_size), border_mode=bm)
-        output_size = ((num_filters,) +
-                       ConvOp.getOutputShape(in_dim[1:], filter_size,
-                                             stride, bm))
-
-        return y, output_size
 
     def g(self, z_lat, z_ver, in_dims, out_dims, l_type, num, fspec, top_g):
         f_layer_type, dims = fspec
@@ -496,97 +437,19 @@ class LadderAE():
         wi = lambda inits, name: self.weight(inits * np.ones(num_filters),
                                              gen_id(name), for_conv=is_conv)
 
-        if g_type == '':
-            z_est = None
-
-        elif g_type == 'i':
-            z_est = z_lat
-
-        elif g_type in ['sig']:
+        if g_type in ['sig']:
             sigval = bi(0., 'c1') + wi(1., 'c2') * z_lat
-            if u is not None:
-                sigval += wi(0., 'c3') * u + wi(0., 'c4') * z_lat * u
+            sigval += wi(0., 'c3') * u + wi(0., 'c4') * z_lat * u
             sigval = T.nnet.sigmoid(sigval)
 
             z_est = bi(0., 'a1') + wi(1., 'a2') * z_lat + wi(1., 'b1') * sigval
-            if u is not None:
-                z_est += wi(0., 'a3') * u + wi(0., 'a4') * z_lat * u
+            z_est += wi(0., 'a3') * u + wi(0., 'a4') * z_lat * u
 
-        elif g_type in ['lin']:
-            a1 = wi(1.0, 'a1')
-            b = bi(0.0, 'b')
-
-            z_est = a1 * z_lat + b
-
-        elif g_type in ['relu']:
-            assert u is not None
-            b = bi(0., 'b')
-            x = u + b
-            z_est = self.apply_act(x, 'relu')
-
-        elif g_type in ['sigmoid']:
-            assert u is not None
-            b = bi(0., 'b')
-            c = wi(1., 'c')
-            z_est = self.apply_act((u + b) * c, 'sigmoid')
-
-        elif g_type in ['comparison_g2']:
-            # sig without the uz cross term
-            sigval = bi(0., 'c1') + wi(1., 'c2') * z_lat
-            if u is not None:
-                sigval += wi(0., 'c3') * u
+        elif g_type in ['vert']:
+            sigval = bi(0., 'c1') + wi(1., 'c2')
             sigval = T.nnet.sigmoid(sigval)
 
-            z_est = bi(0., 'a1') + wi(1., 'a2') * z_lat + wi(1., 'b1') * sigval
-            if u is not None:
-                z_est += wi(0., 'a3') * u
-
-        elif g_type in ['comparison_g3']:
-            # sig without the sigmoid nonlinearity
-            z_est = bi(0., 'a1') + wi(1., 'a2') * z_lat
-            if u is not None:
-                z_est += wi(0., 'a3') * u + wi(0., 'a4') * z_lat * u
-
-        elif g_type in ['comparison_g4']:
-            # No mixing between z_lat and u before final sum, otherwise similar
-            # to sig
-            def nonlin(inp, in_name='input', add_bias=True):
-                w1 = wi(1., 'w1_%s' % in_name)
-                b1 = bi(0., 'b1')
-                w2 = wi(1., 'w2_%s' % in_name)
-                b2 = bi(0., 'b2') if add_bias else 0
-                w3 = wi(0., 'w3_%s' % in_name)
-                return w2 * T.nnet.sigmoid(b1 + w1 * inp) + w3 * inp + b2
-
-            z_est = nonlin(z_lat, 'lat') if u is None else \
-                nonlin(z_lat, 'lat') + nonlin(u, 'ver', False)
-
-        elif g_type in ['comparison_g5']:
-            # Gaussian assumption on z: (z - mu) * v + mu
-            if u is None:
-                b1 = bi(0., 'b1')
-                w1 = wi(1., 'w1')
-                z_est = w1 * z_lat + b1
-            else:
-                a1 = bi(0., 'a1')
-                a2 = wi(1., 'a2')
-                a3 = bi(0., 'a3')
-                a4 = bi(0., 'a4')
-                a5 = bi(0., 'a5')
-
-                a6 = bi(0., 'a6')
-                a7 = wi(1., 'a7')
-                a8 = bi(0., 'a8')
-                a9 = bi(0., 'a9')
-                a10 = bi(0., 'a10')
-
-                mu = a1 * T.nnet.sigmoid(a2 * u + a3) + a4 * u + a5
-                v = a6 * T.nnet.sigmoid(a7 * u + a8) + a9 * u + a10
-
-                z_est = (z_lat - mu) * v + mu
-
-        else:
-            raise NotImplementedError("unknown g type: %s" % str(g_type))
+            z_est = bi(0., 'a1') + wi(1., 'a2') * u + wi(1., 'b1') * sigval
 
         # Reshape the output if z is for conv but u from fc layer
         if (z_est is not None and type(out_dims) == tuple and
@@ -594,46 +457,3 @@ class LadderAE():
             z_est = z_est.reshape((z_est.shape[0],) + out_dims)
 
         return z_est
-
-    def g_deconv(self, z_ver, in_dims, out_dims, weight_name, fspec):
-        """ Inverse operation for each type of f used in convnets """
-        f_type, f_dims = fspec
-        assert z_ver is not None
-        num_channels = in_dims[0] if in_dims is not None else None
-        num_filters, width, height = out_dims[:3]
-
-        if f_type in ['globalmeanpool']:
-            u = T.addbroadcast(z_ver, 2, 3)
-            assert in_dims[1] == 1 and in_dims[2] == 1, \
-                "global pooling needs in_dims (1,1): %s" % str(in_dims)
-
-        elif f_type in ['maxpool']:
-            sh, str, size = z_ver.shape, f_dims[0], f_dims[1]
-            assert str == size, "depooling requires stride == size"
-            u = T.zeros((sh[0], sh[1], sh[2] * str, sh[3] * str),
-                        dtype=z_ver.dtype)
-            for x in xrange(str):
-                for y in xrange(str):
-                    u = T.set_subtensor(u[:, :, x::str, y::str], z_ver)
-            u = u[:, :, :width, :height]
-
-        elif f_type in ['convv', 'convf']:
-            filter_size, str = (f_dims[1], f_dims[1]), f_dims[2]
-            W_shape = (num_filters, num_channels) + filter_size
-            W = self.weight(self.rand_init_conv(W_shape), weight_name)
-            if str > 1:
-                # upsample if strided version
-                sh = z_ver.shape
-                u = T.zeros((sh[0], sh[1], sh[2] * str, sh[3] * str),
-                            dtype=z_ver.dtype)
-                u = T.set_subtensor(u[:, :, ::str, ::str], z_ver)
-            else:
-                u = z_ver  # no strides, only deconv
-            u = conv2d(u, W, filter_shape=W_shape,
-                       border_mode='valid' if 'convf' in f_type else 'full')
-            u = u[:, :, :width, :height]
-        else:
-            raise NotImplementedError('Layer %s has no convolutional decoder'
-                                      % f_type)
-
-        return u
