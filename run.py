@@ -303,7 +303,7 @@ if __name__ == "__main__":
                          (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7)]
     decoder_specs = [('sig', 'sig', 'sig', 'sig', 'sig', 'sig', 'sig'),
                      ('sig', 'vert', 'vert', 'vert', 'vert', 'vert', 'vert')]
-    seed = int(time.time())
+    seed = 1
 
     def pick_random(options):
         random_index = randint(0, len(options) - 1)
@@ -319,12 +319,12 @@ if __name__ == "__main__":
         err = get_error(d)
         logger.info('Test error: %f' % err)
     else:
-        d = {'dseed': pick_random(dseeds), 'seed': 1, 'num_epochs': 150,
-             'lr': pick_random(lrs), 'lrate_decay': 0.67,
-             'unlabeled_samples': 60000, 'labeled_samples': pick_random(labeled_sampless),
-             'denoising_cost_x': pick_random(denoising_cost_xs),
-             'f_local_noise_std': pick_random(f_local_noise_std),
-             'decoder_spec': pick_random(decoder_specs),
+        d = {'dseed': 1, 'seed': 1, 'num_epochs': 150,
+             'lr': 0.002, 'lrate_decay': 0.67,
+             'unlabeled_samples': 60000, 'labeled_samples': 100,
+             'denoising_cost_x': (1000, 10, 0.1, 0.1, 0.1, 0.1, 0.1),
+             'f_local_noise_std': (0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3),
+             'decoder_spec': ('sig', 'sig', 'sig', 'sig', 'sig', 'sig', 'sig'),
              'save_to': 'mnist_all_bottom',
              'cmd': 'train',
              'top_c': True, 'batch_size': 100, 'dataset': 'mnist',
